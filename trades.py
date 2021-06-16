@@ -56,7 +56,7 @@ def trades_loss(model,
     if trainmode == "adv":
         batch_size = len(x_natural)
         # define KL-loss
-        criterion_kl = nn.KLDivLoss(size_average=False)
+        criterion_kl = nn.KLDivLoss(reduction='sum')
         model.eval()
 
         # generate adversarial example

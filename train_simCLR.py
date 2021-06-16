@@ -15,7 +15,7 @@ from optimizer.lars import LARS
 
 parser = argparse.ArgumentParser(description='PyTorch Cifar10 Training')
 parser.add_argument('experiment', type=str, help='location for saving trained models')
-parser.add_argument('--data', type=str, default='../../data', help='location of the data')
+parser.add_argument('--data', type=str, default='../datasets', help='location of the data')
 parser.add_argument('--dataset', type=str, default='cifar10', help='which dataset to be used, (cifar10 or cifar100)')
 parser.add_argument('--batch_size', type=int, default=512, help='batch size')
 parser.add_argument('--epochs', default=1000, type=int, help='number of total epochs to run')
@@ -26,6 +26,7 @@ parser.add_argument('--optimizer', default='lars', type=str, help='optimizer typ
 parser.add_argument('--lr', default=5.0, type=float, help='optimizer lr')
 parser.add_argument('--scheduler', default='cosine', type=str, help='lr scheduler type')
 parser.add_argument('--ACL_DS', action='store_true', help='if specified, use pgd dual mode,(cal both adversarial and clean)')
+parser.add_argument('--ACL_TS', action='store_true', help='if specified, use pgd triple mode,(cal both adversarial, unadversarial and clean)')
 parser.add_argument('--twoLayerProj', action='store_true', help='if specified, use two layers linear head for simclr proj head')
 parser.add_argument('--pgd_iter', default=5, type=int, help='how many iterations employed to attack the model')
 parser.add_argument('--seed', type=int, default=1, help='random seed')
@@ -57,10 +58,12 @@ def main():
     setup_seed(args.seed)
 
     # different attack corresponding to different bn settings
-    if not args.ACL_DS:
-        bn_names = ['normal', ]
+    if args.ACL_DS:
+        bn_names = ['normal', 'adv']
+    elif args.ACL_TS:
+        bn_names = ['normal', 'adv', 'unadv']
     else:
-        bn_names = ['normal', 'pgd']
+        bn_names = ['normal', ]
 
     # define model
     model = resnet18(pretrained=False, bn_names=bn_names)
@@ -74,7 +77,7 @@ def main():
     rnd_color_jitter = transforms.RandomApply([transforms.ColorJitter(0.4 * strength, 0.4 * strength, 0.4 * strength, 0.1 * strength)], p=0.8 * strength)
     rnd_gray = transforms.RandomGrayscale(p=0.2 * strength)
     tfs_train = transforms.Compose([
-        transforms.RandomResizedCrop(32, scale=(1.0 - 0.9 * strength, 1.0), interpolation=3),
+        transforms.RandomResizedCrop(32, scale=(1.0 - 0.9 * strength, 1.0), interpolation=transforms.functional.InterpolationMode.BICUBIC),
         transforms.RandomHorizontalFlip(),
         rnd_color_jitter,
         rnd_gray,
@@ -213,14 +216,20 @@ def train(train_loader, model, optimizer, scheduler, epoch, log, num_classes):
         # print("inputs origin shape is {}".format(d))
         inputs = inputs.view(d[0]*2, d[2], d[3], d[4]).cuda()
 
-        if not args.ACL_DS:
-            features = model.train()(inputs, 'normal')
-            loss = nt_xent(features)
-        else:
+        if args.ACL_DS:
             inputs_adv = PGD_contrastive(model, inputs, iters=args.pgd_iter, singleImg=False)
-            features_adv = model.train()(inputs_adv, 'pgd')
+            features_adv = model.train()(inputs_adv, 'adv')
             features = model.train()(inputs, 'normal')
             loss = (nt_xent(features) + nt_xent(features_adv))/2
+        elif args.ACL_TS:
+            inputs_adv, inputs_unadv = PGD_contrastive_plus(model, inputs, iters=args.pgd_iter, singleImg=False)
+            features_adv = model.train()(inputs_adv, 'adv')
+            features_unadv = model.train()(inputs_unadv, 'unadv')
+            features = model.train()(inputs, 'normal')
+            loss = (nt_xent(features) + nt_xent(features_adv) + nt_xent(features_unadv))/3
+        else:
+            features = model.train()(inputs, 'normal')
+            loss = nt_xent(features)
 
         optimizer.zero_grad()
         loss.backward()
@@ -261,7 +270,7 @@ def validate(train_loader, val_loader, model, log, num_classes=10):
         param.requires_grad = False
 
     previous_fc = model.fc
-    ch = model.fc.in_features
+    ch = model.fc.in_features_VISIBLE
     model.fc = nn.Linear(ch, num_classes)
     model.cuda()
 
@@ -363,7 +372,7 @@ def PGD_contrastive(model, inputs, eps=8. / 255., alpha=2. / 255., iters=10, sin
             if sameBN:
                 features = model.eval()(inputs + delta, 'normal')
             else:
-                features = model.eval()(inputs + delta, 'pgd')
+                features = model.eval()(inputs + delta, 'adv')
         else:
             features = feature_gene(model, inputs + delta, 'eval')
 
@@ -383,6 +392,56 @@ def PGD_contrastive(model, inputs, eps=8. / 255., alpha=2. / 255., iters=10, sin
             delta.data[idx] = torch.clamp(delta.data[idx], min=0, max=0)
 
     return (inputs + delta).detach()
+
+def PGD_contrastive_plus(model, inputs, eps=8. / 255., alpha=2. / 255., iters=10, singleImg=False, feature_gene=None, sameBN=False):
+    # init
+    delta_adv = torch.rand_like(inputs) * eps * 2 - eps
+    delta_adv = torch.nn.Parameter(delta_adv)
+
+    delta_unadv = torch.rand_like(inputs) * eps * 2 - eps
+    delta_unadv = torch.nn.Parameter(delta_unadv)
+
+    # if singleImg:
+    #     # project half of the delta to be zero
+    #     idx = [i for i in range(1, delta.data.shape[0], 2)]
+    #     delta.data[idx] = torch.clamp(delta.data[idx], min=0, max=0)
+
+    for i in range(iters):
+        if sameBN:
+            features_adv = model.eval()(inputs + delta_adv, 'normal')
+            features_unadv = model.eval()(inputs + delta_unadv, 'normal')
+        else:
+            features_adv = model.eval()(inputs + delta_adv, 'adv')
+            features_unadv = model.eval()(inputs + delta_unadv, 'unadv')
+
+        model.zero_grad()
+        loss = nt_xent(features_adv)
+        loss.backward()
+        # print("loss is {}".format(loss))
+
+        delta_adv.data = delta_adv.data + alpha * delta_adv.grad.sign()
+        delta_adv.grad = None
+        delta_adv.data = torch.clamp(delta_adv.data, min=-eps, max=eps)
+        delta_adv.data = torch.clamp(inputs + delta_adv.data, min=0, max=1) - inputs
+
+        # if singleImg:
+        #     # project half of the delta to be zero
+        #     idx = [i for i in range(1, delta.data.shape[0], 2)]
+        #     delta.data[idx] = torch.clamp(delta.data[idx], min=0, max=0)
+
+        model.zero_grad()
+        loss = nt_xent(features_unadv)
+        loss.backward()
+        # print("loss is {}".format(loss))
+
+        delta_unadv.data = delta_unadv.data - alpha * delta_unadv.grad.sign()
+        delta_unadv.grad = None
+        delta_unadv.data = torch.clamp(delta_unadv.data, min=-eps, max=eps)
+        delta_unadv.data = torch.clamp(inputs + delta_unadv.data, min=0, max=1) - inputs
+
+        
+
+    return (inputs + delta_adv).detach(), (inputs + delta_unadv).detach()
 
 
 if __name__ == '__main__':

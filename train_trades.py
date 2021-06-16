@@ -18,13 +18,13 @@ import copy
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR TRADES Adversarial Training')
 parser.add_argument('experiment', type=str, help='exp name')
-parser.add_argument('--data', type=str, default='../../data', help='location of the data')
+parser.add_argument('--data', type=str, default='../datasets', help='location of the data')
 parser.add_argument('--dataset', default='cifar10', type=str, help='dataset to be used (cifar10 or cifar100)')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('--test-batch-size', type=int, default=128, metavar='N',
                     help='input batch size for testing (default: 128)')
-parser.add_argument('--epochs', type=int, default=25, metavar='N',
+parser.add_argument('--epochs', type=int, default=100, metavar='N',
                     help='number of epochs to train')
 parser.add_argument('--weight-decay', '--wd', default=2e-4,
                     type=float, metavar='W')
@@ -60,7 +60,7 @@ parser.add_argument('--fixbn', action='store_true',
                     help='if specified, fix bn for the layers been fixed')
 parser.add_argument('--use_advbn', action='store_true',
                     help='if specified, assign bn value with adv_bn value')
-parser.add_argument('--checkpoint', default='', type=str,
+parser.add_argument('--checkpoint', default='checkpoints/ACL_DS/ACL_DS.pt', type=str,
                     help='path to pretrained model')
 parser.add_argument('--resume', action='store_true',
                     help='if resume training')
@@ -68,9 +68,9 @@ parser.add_argument('--test_adv', action='store_true',
                     help='if test adv in normal mode')
 parser.add_argument('--start-epoch', default=0, type=int,
                     help='the start epoch number')
-parser.add_argument('--decreasing_lr', default='15,20', help='decreasing strategy')
-parser.add_argument('--cvt_state_dict', action='store_true', help='use for ss model')
-parser.add_argument('--bnNameCnt', default=-1, type=int)
+parser.add_argument('--decreasing_lr', default='40,60', help='decreasing strategy')
+parser.add_argument('--cvt_state_dict', action='store_true', help='use for ss model', default=True)
+parser.add_argument('--bnNameCnt', default=1, type=int)
 parser.add_argument('--trainset', type=str, default='train_idx_std',
                     help='set to be employed for training')
 
@@ -84,7 +84,7 @@ log = logger(os.path.join(model_dir))
 use_cuda = not args.no_cuda and torch.cuda.is_available()
 setup_seed(args.seed)
 device = torch.device("cuda" if use_cuda else "cpu")
-kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
+kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
 
 # setup data loader
 transform_train = transforms.Compose([
@@ -110,11 +110,12 @@ else:
     print("dataset {} is not supported".format(args.dataset))
     assert False
 
-
+# Manually split the original training dataset into training set (45000) and validation set (5000)  
 train_idx = list(np.load('split/{}.npy'.format(args.trainset)))
 valid_idx = list(np.load('split/valid_idx_std.npy'))
 
-train_sampler = SubsetRandomSampler(train_idx)
+# Samples elements randomly from a given list of indices, without replacement.
+train_sampler = SubsetRandomSampler(train_idx) 
 valid_sampler = SubsetRandomSampler(valid_idx)
 
 train_loader = torch.utils.data.DataLoader(
@@ -163,7 +164,7 @@ def train(args, model, device, train_loader, optimizer, epoch, log):
     # print progress
     if batch_idx % args.log_interval == 0:
       log.info('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tData time: {:.3f}\tTotal time: {:.3f}'.format(
-        epoch, batch_idx * len(data), len(train_loader.dataset),
+        epoch, batch_idx * len(data), 45000,
                100. * batch_idx / len(train_loader), loss.item(), dataTimeAve.avg, totalTimeAve.avg))
 
 
@@ -176,11 +177,11 @@ def eval_train(model, device, train_loader, log):
     for data, target in train_loader:
       data, target = data.to(device), target.to(device)
       output = model.eval()(data)
-      train_loss += F.cross_entropy(output, target, size_average=False).item()
+      train_loss += F.cross_entropy(output, target, reduction='sum').item()
       pred = output.max(1, keepdim=True)[1]
       correct += pred.eq(target.view_as(pred)).sum().item()
       whole += len(target)
-  train_loss /= len(train_loader.dataset)
+  train_loss /= whole
   log.info('Training: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
     train_loss, correct, whole,
     100. * correct / whole))
@@ -197,11 +198,11 @@ def eval_test(model, device, loader, log):
     for data, target in loader:
       data, target = data.to(device), target.to(device)
       output = model.eval()(data)
-      test_loss += F.cross_entropy(output, target, size_average=False).item()
+      test_loss += F.cross_entropy(output, target, reduction='sum').item()
       pred = output.max(1, keepdim=True)[1]
       correct += pred.eq(target.view_as(pred)).sum().item()
       whole += len(target)
-  test_loss /= len(loader.dataset)
+  test_loss /= whole
   log.info('Test: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
     test_loss, correct, whole,
     100. * correct / whole))
